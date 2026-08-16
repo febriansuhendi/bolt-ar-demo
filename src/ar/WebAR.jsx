@@ -7,9 +7,15 @@ import './styles.css'
 // Change this to your product's purchase page.
 const PRODUCT_URL = 'https://example.com/product'
 
-const MODEL_URL = '/models/product.glb'
+// Combined MindAR image target source. MindAR supports multiple targets in a
+// single .mind file; target indexes are assigned in compilation order.
 const TARGET_URL = '/targets/target.mind'
-const TARGET_INDEX = 0
+
+// target index -> model file
+const TARGETS = [
+  { index: 0, model: '/models/sail.glb' },
+  { index: 1, model: '/models/payung-sekaki.glb' },
+]
 
 export default function WebAR() {
   const containerRef = useRef(null)
@@ -22,42 +28,60 @@ export default function WebAR() {
 
     let mindar = null
     let renderer = null
-    let model = null
     let disposed = false
+    const mixers = []
+    const autoRotate = [] // booleans per target, true when no GLB animation
+    const models = [] // THREE.Object3D per target
+    const clock = new THREE.Clock()
 
-    const setupModel = (anchorGroup) => {
-      return new Promise((resolve) => {
+    const loadModel = (url) =>
+      new Promise((resolve) => {
         const loader = new GLTFLoader()
         loader.load(
-          MODEL_URL,
+          url,
           (gltf) => {
             const root = gltf.scene
-            // Normalize model to roughly fit the image target.
+
+            // Auto-scale to fit the image target using bounding box.
             const box = new THREE.Box3().setFromObject(root)
             const size = box.getSize(new THREE.Vector3())
             const maxDim = Math.max(size.x, size.y, size.z) || 1
             const scale = 1 / maxDim
             root.scale.setScalar(scale)
-            // Place the model sitting just above the target plane.
-            root.position.set(0, size.y * scale * 0.5, 0)
-            anchorGroup.add(root)
-            model = root
-            resolve()
+
+            // Sit just above the target plane so it appears to emerge from it.
+            const scaledHeight = size.y * scale
+            root.position.set(0, scaledHeight * 0.5, 0)
+
+            // Hide until its target is found.
+            root.visible = false
+
+            // Preserve original materials and textures (no overrides).
+
+            let mixer = null
+            let hasAnim = false
+            if (gltf.animations && gltf.animations.length > 0) {
+              mixer = new THREE.AnimationMixer(root)
+              gltf.animations.forEach((clip) => mixer.clipAction(clip).play())
+              mixers.push(mixer)
+              hasAnim = true
+            }
+
+            resolve({ root, hasAnim })
           },
           undefined,
-          () => {
+          (err) => {
+            console.error(`Failed to load model ${url}:`, err)
             // Fallback: simple colored cube placeholder.
             const geo = new THREE.BoxGeometry(0.5, 0.5, 0.5)
             const mat = new THREE.MeshNormalMaterial()
             const cube = new THREE.Mesh(geo, mat)
             cube.position.set(0, 0.25, 0)
-            anchorGroup.add(cube)
-            model = cube
-            resolve()
+            cube.visible = false
+            resolve({ root: cube, hasAnim: false })
           }
         )
       })
-    }
 
     const start = async () => {
       try {
@@ -78,20 +102,42 @@ export default function WebAR() {
         const scene = mindar.scene
         const camera = mindar.camera
 
-        const anchor = mindar.addAnchor(TARGET_INDEX)
-        const anchorGroup = anchor.group
+        // Load every model once, create one anchor per target.
+        for (let i = 0; i < TARGETS.length; i++) {
+          const { index, model } = TARGETS[i]
+          const { root, hasAnim } = await loadModel(model)
 
-        await setupModel(anchorGroup)
+          const anchor = mindar.addAnchor(index)
+          anchor.group.add(root)
 
-        anchor.onTargetFound = () => setStatus('tracking')
-        anchor.onTargetLost = () => setStatus('idle')
+          models[index] = root
+          autoRotate[index] = !hasAnim
+
+          anchor.onTargetFound = () => {
+            if (disposed) return
+            root.visible = true
+            setStatus('tracking')
+          }
+          anchor.onTargetLost = () => {
+            if (disposed) return
+            root.visible = false
+            const anyVisible = models.some((m) => m && m.visible)
+            setStatus(anyVisible ? 'tracking' : 'idle')
+          }
+        }
 
         await mindar.start()
 
         if (disposed) return
 
         renderer.setAnimationLoop(() => {
-          if (model) model.rotation.y += 0.01
+          const d = clock.getDelta()
+          for (let i = 0; i < mixers.length; i++) mixers[i].update(d)
+          for (let i = 0; i < autoRotate.length; i++) {
+            if (autoRotate[i] && models[i] && models[i].visible) {
+              models[i].rotation.y += d * 0.5
+            }
+          }
           renderer.render(scene, camera)
         })
 
@@ -111,6 +157,7 @@ export default function WebAR() {
         try {
           if (renderer) renderer.setAnimationLoop(null)
           if (mindar) await mindar.stop()
+          mixers.forEach((m) => m.update(0))
           if (renderer) renderer.dispose()
         } catch (e) {
           // ignore cleanup errors
